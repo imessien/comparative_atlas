@@ -1,526 +1,164 @@
-from typing import Iterable, Optional, Sequence, Union, Tuple
+from __future__ import annotations
 
-import numpy as np
+from dataclasses import replace
+from typing import TYPE_CHECKING
+
 import torch
-from torch.distributions import Categorical, Normal
-from torch.distributions import kl_divergence as kl
-from torch.nn import functional as F
+from scvi.module import SCANVAE as _SCANVAE
+from scvi.module.base import LossOutput, auto_move_data
 
-from copy import deepcopy
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
-from scvi import REGISTRY_KEYS
-from scvi._compat import Literal
-from scvi.module.base import LossRecorder, auto_move_data
-from scvi.nn import Decoder, Encoder
+# Keys forwarded to ``SCANVAE.loss``; plan/optimizer kwargs (e.g. ``m0_lr``) are stripped.
+_SCANVAE_LOSS_KEYS = frozenset(
+    {
+        "feed_labels",
+        "kl_weight",
+        "labelled_tensors",
+        "classification_ratio",
+        "replay",
+    }
+)
 
-from scvi.module._classifier import Classifier
-from scvi.module._utils import broadcast_labels
-from scvi.module._vae import VAE
-# from ._vae import VAE_GR
 
-from typing import NamedTuple
-
-
-class SCANVAE(VAE):
-    """
-    Single-cell annotation using variational inference.
-    This is an implementation of the scANVI model described in [Xu21]_,
-    inspired from M1 + M2 model, as described in (https://arxiv.org/pdf/1406.5298.pdf).
-    Parameters
-    ----------
-    n_input
-        Number of input genes
-    n_batch
-        Number of batches
-    n_labels
-        Number of labels
-    n_hidden
-        Number of nodes per hidden layer
-    n_latent
-        Dimensionality of the latent space
-    n_layers
-        Number of hidden layers used for encoder and decoder NNs
-    n_continuous_cov
-        Number of continuous covarites
-    n_cats_per_cov
-        Number of categories for each extra categorical covariate
-    dropout_rate
-        Dropout rate for neural networks
-    dispersion
-        One of the following
-        * ``'gene'`` - dispersion parameter of NB is constant per gene across cells
-        * ``'gene-batch'`` - dispersion can differ between different batches
-        * ``'gene-label'`` - dispersion can differ between different labels
-        * ``'gene-cell'`` - dispersion can differ for every gene in every cell
-    log_variational
-        Log(data+1) prior to encoding for numerical stability. Not normalization.
-    gene_likelihood
-        One of
-        * ``'nb'`` - Negative binomial distribution
-        * ``'zinb'`` - Zero-inflated negative binomial distribution
-    y_prior
-        If None, initialized to uniform probability over cell types
-    labels_groups
-        Label group designations
-    use_labels_groups
-        Whether to use the label groups
-    use_batch_norm
-        Whether to use batch norm in layers
-    use_layer_norm
-        Whether to use layer norm in layers
-    **vae_kwargs
-        Keyword args for :class:`~scvi.module.VAE`
-    """
-
-    def __init__(
-        self,
-        n_input: int,
-        n_batch: int = 0,
-        n_labels: int = 0,
-        n_hidden: int = 128,
-        n_latent: int = 10,
-        n_layers: int = 1,
-        n_continuous_cov: int = 0,
-        n_cats_per_cov: Optional[Iterable[int]] = None,
-        dropout_rate: float = 0.1,
-        dispersion: str = "gene",
-        log_variational: bool = True,
-        gene_likelihood: str = "zinb",
-        y_prior=None,
-        labels_groups: Sequence[int] = None,
-        use_labels_groups: bool = False,
-        classifier_parameters: dict = dict(),
-        use_batch_norm: Literal["encoder", "decoder", "none", "both"] = "both",
-        use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "none",
-        # n_control: int = None,
-        **vae_kwargs
-    ):
-        super().__init__(
-            n_input,
-            n_hidden=n_hidden,
-            n_latent=n_latent,
-            n_layers=n_layers,
-            n_continuous_cov=n_continuous_cov,
-            n_cats_per_cov=n_cats_per_cov,
-            dropout_rate=dropout_rate,
-            n_batch=n_batch,
-            dispersion=dispersion,
-            log_variational=log_variational,
-            gene_likelihood=gene_likelihood,
-            use_batch_norm=use_batch_norm,
-            use_layer_norm=use_layer_norm,
-            **vae_kwargs
-        )
-
-        use_batch_norm_encoder = use_batch_norm == "encoder" or use_batch_norm == "both"
-        use_batch_norm_decoder = use_batch_norm == "decoder" or use_batch_norm == "both"
-        use_layer_norm_encoder = use_layer_norm == "encoder" or use_layer_norm == "both"
-        use_layer_norm_decoder = use_layer_norm == "decoder" or use_layer_norm == "both"
-
-        # hard-code for now
+class SCANVAE(_SCANVAE):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.combine_type = "product"
-        
-        self.n_labels = n_labels
-        # Classifier takes n_latent as input
-        cls_parameters = {
-            "n_layers": n_layers,
-            "n_hidden": n_hidden,
-            "dropout_rate": dropout_rate,
-        }
-        cls_parameters.update(classifier_parameters)
-        self.classifier = Classifier(
-            n_latent,
-            n_labels=n_labels,
-            use_batch_norm=use_batch_norm_encoder,
-            use_layer_norm=use_layer_norm_encoder,
-            **cls_parameters
-        )
-         
-        # self.control_size = n_control
-        self.encoder_z2_z1 = Encoder(
-            n_latent,
-            n_latent,
-            n_cat_list=[self.n_labels],
-            n_layers=n_layers,
-            n_hidden=n_hidden,
-            dropout_rate=dropout_rate,
-            use_batch_norm=use_batch_norm_encoder,
-            use_layer_norm=use_layer_norm_encoder,
-        )
-        self.decoder_z1_z2 = Decoder(
-            n_latent,
-            n_latent,
-            n_cat_list=[self.n_labels],
-            n_layers=n_layers,
-            n_hidden=n_hidden,
-            use_batch_norm=use_batch_norm_decoder,
-            use_layer_norm=use_layer_norm_decoder,
-        )
+        self.old_params: list = []
 
-        self.y_prior = torch.nn.Parameter(
-            y_prior
-            if y_prior is not None
-            else (1 / n_labels) * torch.ones(1, n_labels),
-            requires_grad=False,
-        )
-        self.use_labels_groups = use_labels_groups
-        self.labels_groups = (
-            np.array(labels_groups) if labels_groups is not None else None
-        )
-        if self.use_labels_groups:
-            if labels_groups is None:
-                raise ValueError("Specify label groups")
-            unique_groups = np.unique(self.labels_groups)
-            self.n_groups = len(unique_groups)
-            if not (unique_groups == np.arange(self.n_groups)).all():
-                raise ValueError()
-            self.classifier_groups = Classifier(
-                n_latent, n_hidden, self.n_groups, n_layers, dropout_rate
-            )
-            self.groups_index = torch.nn.ParameterList(
-                [
-                    torch.nn.Parameter(
-                        torch.tensor(
-                            (self.labels_groups == i).astype(np.uint8),
-                            dtype=torch.uint8,
-                        ),
-                        requires_grad=False,
-                    )
-                    for i in range(self.n_groups)
-                ]
-            )
-
-    @auto_move_data
-    def classify(self, x, batch_index=None, cont_covs=None, cat_covs=None):
-        if self.log_variational:
-            x = torch.log(1 + x)
-
-        if cont_covs is not None and self.encode_covariates:
-            encoder_input = torch.cat((x, cont_covs), dim=-1)
-        else:
-            encoder_input = x
-        if cat_covs is not None and self.encode_covariates:
-            categorical_input = torch.split(cat_covs, 1, dim=1)
-        else:
-            categorical_input = tuple()
-
-        qz_m, _, z = self.z_encoder(encoder_input, batch_index, *categorical_input)
-        # We classify using the inferred mean parameter of z_1 in the latent space
-        z = qz_m
-        if self.use_labels_groups:
-            w_g = self.classifier_groups(z)
-            unw_y = self.classifier(z)
-            w_y = torch.zeros_like(unw_y)
-            for i, group_index in enumerate(self.groups_index):
-                unw_y_g = unw_y[:, group_index]
-                w_y[:, group_index] = unw_y_g / (
-                    unw_y_g.sum(dim=-1, keepdim=True) + 1e-8
+    def register_ewc_snapshots(self) -> None:
+        importances = getattr(self, "importances", None)
+        ctrl_importances = getattr(self, "ctrl_importances", None)
+        old_params = getattr(self, "old_params", None)
+        if not old_params or importances is None or ctrl_importances is None:
+            return
+        for name in list(self._buffers.keys()):
+            if name.startswith("ewc_snap_"):
+                del self._buffers[name]
+        for i, ((kn, to), (ki, ti), (kc, tc)) in enumerate(
+            zip(old_params, importances, ctrl_importances)
+        ):
+            if kn != ki or kn != kc:
+                raise ValueError(
+                    f"EWC tensor lists misaligned at index {i}: {kn!r}, {ki!r}, {kc!r}"
                 )
-                w_y[:, group_index] *= w_g[:, [i]]
-        else:
-            w_y = self.classifier(z)
-        return w_y
+            self.register_buffer(f"ewc_snap_old_{i}", to.detach().clone())
+            self.register_buffer(f"ewc_snap_imp_{i}", ti.detach().clone())
+            self.register_buffer(f"ewc_snap_ctrl_{i}", tc.detach().clone())
+        n = len(old_params)
+        self.register_buffer("ewc_snap_count", torch.tensor([n], dtype=torch.long))
 
-    @auto_move_data
-    def classification_loss(self, labelled_dataset):
-        x = labelled_dataset[REGISTRY_KEYS.X_KEY]
-        y = labelled_dataset[REGISTRY_KEYS.LABELS_KEY]
-        batch_idx = labelled_dataset[REGISTRY_KEYS.BATCH_KEY]
-        cont_key = REGISTRY_KEYS.CONT_COVS_KEY
-        cont_covs = (
-            labelled_dataset[cont_key] if cont_key in labelled_dataset.keys() else None
-        )
+    def register_ewc_buffers_from_state_dict(self, state_dict: dict) -> bool:
+        ewc_keys = [k for k in state_dict if k.startswith("ewc_snap_")]
+        if not ewc_keys:
+            return False
+        for name in list(self._buffers.keys()):
+            if name.startswith("ewc_snap_"):
+                del self._buffers[name]
+        for key in ewc_keys:
+            self.register_buffer(key, state_dict[key].detach().clone())
+        return True
 
-        cat_key = REGISTRY_KEYS.CAT_COVS_KEY
-        cat_covs = (
-            labelled_dataset[cat_key] if cat_key in labelled_dataset.keys() else None
-        )
-        classification_loss = F.cross_entropy(
-            self.classify(
-                x, batch_index=batch_idx, cat_covs=cat_covs, cont_covs=cont_covs
-            ),
-            y.view(-1).long(),
-        )
-        return classification_loss
+    def _ensure_ewc_lists_from_buffers(self) -> None:
+        if getattr(self, "old_params", None) and len(self.old_params) > 0:
+            return
+        if "ewc_snap_count" not in self._buffers:
+            return
+        n = int(self.get_buffer("ewc_snap_count").item())
+        req_names = [name for name, p in self.named_parameters() if p.requires_grad]
+        if len(req_names) != n or n == 0:
+            return
+        old_out = []
+        imp_out = []
+        ctrl_out = []
+        for i, name in enumerate(req_names):
+            old_out.append((name, self.get_buffer(f"ewc_snap_old_{i}")))
+            imp_out.append((name, self.get_buffer(f"ewc_snap_imp_{i}")))
+            ctrl_out.append((name, self.get_buffer(f"ewc_snap_ctrl_{i}")))
+        self.old_params = old_out
+        self.importances = imp_out
+        self.ctrl_importances = ctrl_out
 
-    def loss(
-        self,
-        tensors,
-        inference_outputs,
-        generative_outputs,
-        feed_labels=False,
-        ewc_importance=0,
-        kl_weight=1,
-        labelled_tensors=None,
-        classification_ratio=None,
-        replay=False,
-    ):
-        
-        
-        px_r = generative_outputs["px_r"]
-        px_rate = generative_outputs["px_rate"]
-        px_dropout = generative_outputs["px_dropout"]
-        qz1_m = inference_outputs["qz_m"]
-        qz1_v = inference_outputs["qz_v"]
-        z1 = inference_outputs["z"]
-        x = tensors[REGISTRY_KEYS.X_KEY]
-        batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
-        if feed_labels:
-            y = tensors[REGISTRY_KEYS.LABELS_KEY]
-        else:
-            y = None
-        is_labelled = False if y is None else True
-        
-            
-        # Enumerate choices of label
-        ys, z1s = broadcast_labels(y, z1, n_broadcast=self.n_labels)
-        qz2_m, qz2_v, z2 = self.encoder_z2_z1(z1s, ys)
-        pz1_m, pz1_v = self.decoder_z1_z2(z2, ys)
-        
-        
-        reconst_loss = self.get_reconstruction_loss(x, px_rate, px_r, px_dropout)
-
-
-        # KL Divergence
-        mean = torch.zeros_like(qz2_m)
-        scale = torch.ones_like(qz2_v)
-
-        kl_divergence_z2 = kl(
-            Normal(qz2_m, torch.sqrt(qz2_v)), Normal(mean, scale)
-        ).sum(dim=1)
-        
-
-        
-        loss_z1_unweight = -Normal(pz1_m, torch.sqrt(pz1_v)).log_prob(z1s).sum(dim=-1)
-        loss_z1_weight = Normal(qz1_m, torch.sqrt(qz1_v)).log_prob(z1).sum(dim=-1)
-        if not self.use_observed_lib_size:
-            ql_m = inference_outputs["ql_m"]
-            ql_v = inference_outputs["ql_v"]
-            (
-                local_library_log_means,
-                local_library_log_vars,
-            ) = self._compute_local_library_params(batch_index)
-
-            kl_divergence_l = kl(
-                Normal(ql_m, torch.sqrt(ql_v)),
-                Normal(local_library_log_means, torch.sqrt(local_library_log_vars)),
-            ).sum(dim=1)
-        else:
-            kl_divergence_l = 0.0
-
-        if is_labelled:
-            loss = reconst_loss + loss_z1_weight + loss_z1_unweight
-            kl_locals = {
-                "kl_divergence_z2": kl_divergence_z2,
-                "kl_divergence_l": kl_divergence_l,
-            }
-            if labelled_tensors is not None:
-                classifier_loss = self.classification_loss(labelled_tensors)
-                loss += classifier_loss * classification_ratio
-                return LossRecorder(
-                    loss,
-                    reconst_loss,
-                    kl_locals,
-                    classification_loss=classifier_loss,
-                    n_labelled_tensors=labelled_tensors[REGISTRY_KEYS.X_KEY].shape[0],
-                    
-                )
-            return LossRecorder(
-                loss,
-                reconst_loss,
-                kl_locals,
-                kl_global=torch.tensor(0.0),
-                
-            )
-
-        probs = self.classifier(z1)
-        reconst_loss += loss_z1_weight + (
-            (loss_z1_unweight).view(self.n_labels, -1).t() * probs
-        ).sum(dim=1)
-
-        kl_divergence = (kl_divergence_z2.view(self.n_labels, -1).t() * probs).sum(
-            dim=1
-        )
-        kl_divergence += kl(
-            Categorical(probs=probs),
-            Categorical(probs=self.y_prior.repeat(probs.size(0), 1)),
-        )
-        kl_divergence += kl_divergence_l
-
-        loss = torch.mean(reconst_loss + kl_divergence * kl_weight)
-
-        if labelled_tensors is not None:
-            classifier_loss = self.classification_loss(labelled_tensors)
-            loss += classifier_loss * classification_ratio
-            return LossRecorder(
-                loss,
-                reconst_loss,
-                kl_divergence,
-                classification_loss=classifier_loss,
-                
-            )
-        return LossRecorder(loss, reconst_loss, kl_divergence, #reconst_loss_replay=reconst_loss_replay
-                           )
-    
-    
-    
-    @auto_move_data
     def loss_with_replay(
         self,
         tensors,
         inference_outputs,
         generative_outputs,
-        loss_kwargs,
-       
-    ):
-        loss_kwargs = _get_dict_if_none(loss_kwargs)
-        ewc_importance = loss_kwargs['ewc_importance']
-        
-        
-        losses = self.loss(
-            tensors, 
-            inference_outputs, 
-            generative_outputs, 
-            **loss_kwargs
+        loss_kwargs=None,
+    ) -> LossOutput:
+        loss_kwargs = dict(loss_kwargs or {})
+        ewc_importance = float(loss_kwargs.pop("ewc_importance", 0.0))
+        scanvi_loss_kwargs = {
+            key: loss_kwargs[key] for key in _SCANVAE_LOSS_KEYS if key in loss_kwargs
+        }
+        loss_output = self.loss(
+            tensors, inference_outputs, generative_outputs, **scanvi_loss_kwargs
         )
+        self._ensure_ewc_lists_from_buffers()
 
-        
-        
+        old_params = getattr(self, "old_params", None)
+        if (
+            ewc_importance == 0
+            or old_params is None
+            or len(old_params) == 0
+            or not hasattr(self, "importances")
+            or not hasattr(self, "ctrl_importances")
+        ):
+            return loss_output
 
-       
-        
-        keep_params = [n for n,p in self.old_params]
-        
-        cur_params = [ (n, p) for n,p in self.named_parameters() if n in keep_params]
-        
-        
-        # should be computed here so that they appear correctly in logs even if inactive
-        penalty = torch.tensor(0.0)
-        penalty = penalty.to(self.device)
-       
-        for (_, ctrl_imp), (_, cur_param), (n, saved_param), (_, imp) in zip(
-                    self.ctrl_importances,
-                    cur_params,
-                    self.old_params,
-                    self.importances,
-                ):
+        old_by_name = dict(old_params)
+        imp_by_name = dict(self.importances)
+        ctrl_by_name = dict(self.ctrl_importances)
+        penalty = torch.tensor(0.0, device=loss_output.loss.device)
+
+        for name, cur_param in self.named_parameters():
+            if name not in old_by_name:
+                continue
+            dev = cur_param.device
+            saved_param = old_by_name[name].to(dev)
+            imp = imp_by_name[name].to(dev)
+            ctrl_imp = ctrl_by_name[name].to(dev)
             if cur_param.size() == saved_param.size():
                 if self.combine_type == "product":
-                    penalty += ((imp * ctrl_imp) * (cur_param - saved_param).pow(2)).sum()
+                    penalty += (
+                        (imp * ctrl_imp) * (cur_param - saved_param).pow(2)
+                    ).sum()
                 if self.combine_type == "additive":
-                    penalty += ((imp + ctrl_imp) * (cur_param - saved_param).pow(2)).sum()
-                    
-            else:
-                penalty += 0.0
-            
-        
-        loss_total = losses.loss + ewc_importance*penalty
-             
+                    penalty += (
+                        (imp + ctrl_imp) * (cur_param - saved_param).pow(2)
+                    ).sum()
 
-        return LossRecorder(
-            loss_total, losses.reconstruction_loss, losses.kl_local, 
-            ewc_loss = penalty,
-            # ctrl_ewc_loss = penalty_ctrl
-        )  # note the component of this LossRecorder different from original
-        
-        
-    
+        return replace(loss_output, loss=loss_output.loss + ewc_importance * penalty)
+
     @auto_move_data
     def _replay_forward(
         self,
         tensors,
-        get_inference_input_kwargs: Optional[dict] = None,
-        get_generative_input_kwargs: Optional[dict] = None,
-        inference_kwargs: Optional[dict] = None,
-        generative_kwargs: Optional[dict] = None,
-        loss_kwargs: Optional[dict] = None,
-        compute_loss=True,
-    ) -> Union[
-        Tuple[torch.Tensor, torch.Tensor],
-        Tuple[torch.Tensor, torch.Tensor, LossRecorder],
-    ]:
-        """
-        Forward pass through the network.
+        get_inference_input_kwargs: dict | None = None,
+        get_generative_input_kwargs: dict | None = None,
+        inference_kwargs: dict | None = None,
+        generative_kwargs: dict | None = None,
+        loss_kwargs: dict | None = None,
+        compute_loss: bool = True,
+    ):
+        get_inference_input_kwargs = get_inference_input_kwargs or {}
+        get_generative_input_kwargs = get_generative_input_kwargs or {}
+        inference_kwargs = inference_kwargs or {}
+        generative_kwargs = generative_kwargs or {}
+        loss_kwargs = loss_kwargs or {}
 
-        Parameters
-        ----------
-        tensors
-            tensors to pass through
-        get_inference_input_kwargs
-            Keyword args for ``_get_inference_input()``
-        get_generative_input_kwargs
-            Keyword args for ``_get_generative_input()``
-        inference_kwargs
-            Keyword args for ``inference()``
-        generative_kwargs
-            Keyword args for ``generative()``
-        loss_kwargs
-            Keyword args for ``loss()``
-        compute_loss
-            Whether to compute loss on forward pass. This adds
-            another return value.
-        """
-        return _replay_generic_forward(
-            self,
-            tensors,
-            inference_kwargs,
-            generative_kwargs,
-            loss_kwargs,
-            get_inference_input_kwargs,
-            get_generative_input_kwargs,
-            compute_loss,
+        inference_inputs = self._get_inference_input(tensors, **get_inference_input_kwargs)
+        inference_outputs = self.inference(**inference_inputs, **inference_kwargs)
+        generative_inputs = self._get_generative_input(
+            tensors, inference_outputs, **get_generative_input_kwargs
         )
-    
+        generative_outputs = self.generative(**generative_inputs, **generative_kwargs)
 
-
-    
-def _get_dict_if_none(param):
-    param = {} if not isinstance(param, dict) else param
-
-    return param    
-
-def _replay_generic_forward(
-    module,
-    tensors,
-    inference_kwargs,
-    generative_kwargs,
-    loss_kwargs,
-    get_inference_input_kwargs,
-    get_generative_input_kwargs,
-    compute_loss,
-):
-    """Core of the forward call shared by PyTorch- and Jax-based modules."""
-    inference_kwargs = _get_dict_if_none(inference_kwargs)
-    generative_kwargs = _get_dict_if_none(generative_kwargs)
-#     loss_kwargs = _get_dict_if_none(loss_kwargs)
-    get_inference_input_kwargs = _get_dict_if_none(get_inference_input_kwargs)
-    get_generative_input_kwargs = _get_dict_if_none(get_generative_input_kwargs)
-
-    inference_inputs = module._get_inference_input(
-        tensors,  **get_inference_input_kwargs
-    )
-
-    inference_outputs = module.inference(**inference_inputs, **inference_kwargs)
-
-    generative_inputs = module._get_generative_input(
-        tensors, inference_outputs, **get_generative_input_kwargs
-    )
-
-    generative_outputs = module.generative(**generative_inputs, **generative_kwargs)
-
-
-
-    
-
-
-    if compute_loss:
-        losses = module.loss_with_replay(
-            tensors, 
-            inference_outputs, 
-            generative_outputs,
-            loss_kwargs # **loss_kwargs  -- replay_importance is passed here 
-        )
-
-        return inference_outputs, generative_outputs, losses
-    else:
+        if compute_loss:
+            losses = self.loss_with_replay(
+                tensors, inference_outputs, generative_outputs, loss_kwargs
+            )
+            return inference_outputs, generative_outputs, losses
         return inference_outputs, generative_outputs

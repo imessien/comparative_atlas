@@ -1,35 +1,27 @@
-from typing import Iterable, Optional, Sequence, Union, Tuple
-from scvi.module.base import LossRecorder, auto_move_data
-
 import torch
-from torch.utils.data import DataLoader
-from scvi.data import AnnDataManager
-
-from scvi.dataloaders._anntorchdataset import AnnTorchDataset
-from anndata import AnnData
-
-# from scvi.data import _constants
-from scvi import REGISTRY_KEYS
 
 
 
 
 
 def mask_augment(
-    x, 
-    mask_percentage: float = 0.15, 
-    pply_prob: float = 0.5
+    x,
+    mask_percentage: float = 0.15,
+    pply_prob: float = 0.5,
 ):
     batch_size, feature_dim = x.shape
+    dev = x.device
     num_masked = int(mask_percentage * feature_dim)
-    mask = torch.cat([
-            torch.ones(num_masked, dtype=torch.bool),
-            torch.zeros(feature_dim - num_masked, dtype=torch.bool)
-        ])
-    mask = mask[torch.randperm(mask.size(0))]  # shape: (feature_dim,)
-    mask = mask.unsqueeze(0).expand(batch_size, -1)  # broadcast to (B, D)
+    mask = torch.cat(
+        [
+            torch.ones(num_masked, dtype=torch.bool, device=dev),
+            torch.zeros(feature_dim - num_masked, dtype=torch.bool, device=dev),
+        ]
+    )
+    mask = mask[torch.randperm(mask.size(0), device=dev)]
+    mask = mask.unsqueeze(0).expand(batch_size, -1)
 
-    return x*mask
+    return x * mask
     
 def compute_uncertainty_scores(
     inference_inputs, 
@@ -37,16 +29,18 @@ def compute_uncertainty_scores(
     device,
     tta_rep = 10,
 ):
-    # print(inference_inputs.keys())
-    input_x = inference_inputs['x']
-    # input_x = inference_inputs[REGISTRY_KEYS.X_KEY]
-    # input_x = input_x.to(device)
+    # DataLoader tensors are CPU by default — move encoder inputs onto the model device
+    # so TTA inference runs on CUDA when the SCANVI module is on GPU (see get_uncertainty).
+    inference_inputs = {
+        k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+        for k, v in inference_inputs.items()
+    }
+    input_x = inference_inputs["x"]
     with torch.no_grad():
         model.module.eval()
         all_zs = []
         for rep in range(tta_rep):
-            # inference_inputs[REGISTRY_KEYS.X_KEY] = mask_augment(input_x)
-            inference_inputs['x'] = mask_augment(input_x)
+            inference_inputs["x"] = mask_augment(input_x)
             inference_outputs = model.module.inference(**inference_inputs)
             all_zs.append(inference_outputs['z'])
         zs_out = torch.stack(all_zs).detach().cpu() # tta_rep x batch_size x n_latent
