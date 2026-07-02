@@ -3,6 +3,8 @@
 
 # Incremental comparative Atlas Construction with Bregman-Regularized Replay
 
+> **PBMC fork note:** This tree is vendored inside [PBMC_ageing_atlas](https://github.com/imessien/Inflammaging_Network). The Parse perturbation path uses backed energy-only TTA (`cscanvi._adapt.TTA_SCANVI`), not the BI replay workflow below.
+
 
 This repository implements an incremental comparative atlas construction framework using:
 

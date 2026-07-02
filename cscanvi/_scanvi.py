@@ -10,8 +10,10 @@ import numpy as np
 import torch
 from anndata import AnnData
 from scvi import REGISTRY_KEYS
-from scvi.data import _constants
+from scvi.data import AnnDataManager, _constants, fields
 from scvi.data._constants import _MODEL_NAME_KEY, _SETUP_ARGS_KEY, _SETUP_METHOD_NAME
+from scvi.data._manager import AnnDataManagerValidationCheck
+from scvi.data._utils import _get_adata_minify_type
 from scvi.model._scanvi import SCANVI as _SCANVI
 from scvi.model._utils import parse_device_args
 from scvi.model.base._archesmixin import _get_loaded_data, _set_params_online_update
@@ -60,6 +62,44 @@ def _device_from_use_gpu(use_gpu: Union[bool, str, int, None]) -> torch.device:
 class SCANVI(_SCANVI):
     _module_cls = SCANVAE
     _training_plan_cls = CLSemiSupervisedTrainingPlan
+
+    @classmethod
+    def setup_anndata(
+        cls,
+        adata: AnnData,
+        labels_key: str,
+        unlabeled_category: str,
+        layer: str | None = None,
+        batch_key: str | None = None,
+        size_factor_key: str | None = None,
+        categorical_covariate_keys: list[str] | None = None,
+        continuous_covariate_keys: list[str] | None = None,
+        use_minified: bool = True,
+        **kwargs,
+    ):
+        """Register AnnData; skip view check so backed gene slices work."""
+        setup_method_args = cls._get_setup_method_args(**locals())
+        anndata_fields = [
+            fields.LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=True),
+            fields.CategoricalObsField(REGISTRY_KEYS.BATCH_KEY, batch_key),
+            fields.LabelsWithUnlabeledObsField(
+                REGISTRY_KEYS.LABELS_KEY, labels_key, unlabeled_category
+            ),
+            fields.NumericalObsField(REGISTRY_KEYS.SIZE_FACTOR_KEY, size_factor_key, required=False),
+            fields.CategoricalJointObsField(REGISTRY_KEYS.CAT_COVS_KEY, categorical_covariate_keys),
+            fields.NumericalJointObsField(REGISTRY_KEYS.CONT_COVS_KEY, continuous_covariate_keys),
+        ]
+        if adata:
+            adata_minify_type = _get_adata_minify_type(adata)
+            if adata_minify_type is not None and use_minified:
+                anndata_fields += cls._get_fields_for_adata_minification(adata_minify_type)
+            adata_manager = AnnDataManager(
+                fields=anndata_fields,
+                setup_method_args=setup_method_args,
+                validation_checks=AnnDataManagerValidationCheck(check_if_view=False),
+            )
+            adata_manager.register_fields(adata, **kwargs)
+            cls.register_manager(adata_manager)
 
     def _latent_encoder_module(self):
         return self.module

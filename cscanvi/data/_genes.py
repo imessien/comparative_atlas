@@ -144,25 +144,33 @@ def resolve_gene_panel(
     return model[model.isin(obs_set) & model.isin(parse_set)]
 
 
+def _read_parse_var_names(parse_path: Path) -> pd.Index:
+    backed = ad.read_h5ad(parse_path, backed="r")
+    try:
+        return pd.Index(map(str, backed.var_names))
+    finally:
+        if getattr(backed, "file", None) is not None:
+            backed.file.close()
+
+
 def resolve_parse_gene_panel(
     obs_path: str | Path,
     parse_path: str | Path,
     model_var_names: pd.Index,
-    *,
-    parse_var_slice: pd.Index | None = None,
 ) -> pd.Index:
+    """gene_panel = model_genes ∩ hvg_obs ∩ genes_present_in_Parse.var"""
     obs_path, parse_path = Path(obs_path), Path(parse_path)
+    model = pd.Index(map(str, model_var_names))
     logger.info("GPU HVG: observational %s", obs_path)
     hvg_obs = gpu_hvg_genes(obs_path, desc="HVG observational")
-    logger.info("GPU HVG: Parse %s", parse_path)
-    hvg_parse = gpu_hvg_genes(parse_path, var_names=parse_var_slice, desc="HVG Parse")
-    panel = resolve_gene_panel(model_var_names, hvg_obs, hvg_parse)
+    parse_var = _read_parse_var_names(parse_path)
+    panel = resolve_gene_panel(model, hvg_obs, parse_var)
     logger.info(
-        "Gene panel: %d (model=%d, hvg_obs=%d, hvg_parse=%d)",
+        "Gene panel: %d = model(%d) ∩ hvg_obs(%d) ∩ parse.var(%d)",
         len(panel),
-        len(model_var_names),
+        len(model),
         len(hvg_obs),
-        len(hvg_parse),
+        len(parse_var),
     )
     return panel
 
@@ -177,6 +185,14 @@ def _slice_tensor(param: torch.Tensor, positions: list[int], *, axis: int) -> to
     return torch.index_select(param, axis, idx)
 
 
+def _assign_param(module: torch.nn.Module, name: str, tensor: torch.Tensor) -> None:
+    parts = name.split(".")
+    parent = module
+    for part in parts[:-1]:
+        parent = getattr(parent, part)
+    setattr(parent, parts[-1], torch.nn.Parameter(tensor))
+
+
 def slice_module_to_genes(module: torch.nn.Module, positions: list[int]) -> None:
     n_genes = len(positions)
     with torch.no_grad():
@@ -184,15 +200,18 @@ def slice_module_to_genes(module: torch.nn.Module, positions: list[int]) -> None
             px_r = module.px_r
             if px_r.ndim == 1 and px_r.shape[0] > n_genes:
                 module.px_r = torch.nn.Parameter(_slice_tensor(px_r, positions, axis=0))
+        replacements: list[tuple[str, torch.Tensor]] = []
         for name, param in module.named_parameters():
             if param.ndim != 2:
                 if "decoder" in name and "bias" in name and param.shape[0] > n_genes:
-                    param.copy_(_slice_tensor(param.data, positions, axis=0))
+                    replacements.append((name, _slice_tensor(param.data, positions, axis=0)))
                 continue
             if "encoder.fc_layers.Layer 0.0.weight" in name and param.shape[1] > n_genes:
-                param.copy_(_slice_tensor(param.data, positions, axis=1))
+                replacements.append((name, _slice_tensor(param.data, positions, axis=1)))
             elif "decoder" in name and "weight" in name and param.shape[0] > n_genes:
-                param.copy_(_slice_tensor(param.data, positions, axis=0))
+                replacements.append((name, _slice_tensor(param.data, positions, axis=0)))
+        for name, tensor in replacements:
+            _assign_param(module, name, tensor)
     if hasattr(module, "n_input") and module.n_input != n_genes:
         module.n_input = n_genes
 
@@ -201,17 +220,21 @@ def slice_model_to_genes(
     model: object,
     gene_panel: pd.Index,
     full_var_names: pd.Index,
-) -> pd.Index:
+) -> tuple[pd.Index, bool]:
     panel = pd.Index(map(str, gene_panel))
     full = pd.Index(map(str, full_var_names))
     if len(panel) == len(full) and panel.equals(full):
-        return panel
+        return panel, False
     missing = panel[~panel.isin(full)]
     if len(missing):
         raise ValueError(
             f"{len(missing)} panel genes absent from model vars, e.g. {missing[:3].tolist()}"
         )
     positions = _gene_positions(full, panel)
+    n_input = getattr(getattr(model, "module", None), "n_input", None)
+    if n_input == len(panel):
+        logger.info("Model already sliced to %d genes", len(panel))
+        return panel, False
     slice_module_to_genes(model.module, positions)
     m0 = getattr(model, "m0_model", None)
     if m0 is not None:
@@ -220,7 +243,7 @@ def slice_model_to_genes(
     if m0_mod is not None:
         slice_module_to_genes(m0_mod, positions)
     logger.info("Sliced model genes: %d -> %d", len(full), len(panel))
-    return panel
+    return panel, True
 
 
 if __name__ == "__main__":

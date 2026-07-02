@@ -1,7 +1,7 @@
-from scvi.train import SemiSupervisedTrainingPlan
+from scvi.train import SemiSupervisedAdversarialTrainingPlan
 
 
-class CLSemiSupervisedTrainingPlan(SemiSupervisedTrainingPlan):
+class CLSemiSupervisedTrainingPlan(SemiSupervisedAdversarialTrainingPlan):
     def log(self, name, value, *args, **kwargs):
         trainer = getattr(self, "trainer", None)
         if kwargs.get("on_epoch") and trainer is not None and trainer.world_size > 1:

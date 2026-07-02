@@ -1,38 +1,24 @@
-"""PyTorch / Lightning backed streaming: gene-sliced HDF5 rows → DataLoader.
-
-CuPy HVG and model gene slicing live in ``_genes.py``.
-This module is the inference stack:
-
-  setup_backed_anndata  →  AnnTorchDataset (HDF5 row slices)
-                       →  BackedScanviDataModule (torch DataLoader)
-                       →  TTALightningModule (TTA) or SCANVI.embed_latent_from_backed
-"""
+"""Backed HDF5 streaming for Parse inference: gene-sliced views, DataLoaders, TTA."""
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import anndata as ad
-import h5py
 import lightning as L
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 import torch
-from anndata.abc import CSCDataset, CSRDataset
 from scvi import REGISTRY_KEYS
+from scvi.data import AnnDataManager
 from scvi.data._constants import _SETUP_ARGS_KEY, _SETUP_METHOD_NAME
-from torch.utils.data import DataLoader, Dataset, Subset
-
-from ._utils import registry_key_to_default_dtype, scipy_to_torch_sparse
+from torch.utils.data import DataLoader, Dataset
 
 logger = logging.getLogger(__name__)
-
-SparseDataset = (CSRDataset, CSCDataset)
 
 
 def close_h5ad(adata: ad.AnnData | None) -> None:
@@ -119,39 +105,10 @@ def materialize_backed_slice(
     return out
 
 
-def registry_slice_for_inference(
-    adata: ad.AnnData,
-    gene_names: pd.Index,
-    *,
-    row_index: np.ndarray | None = None,
-    labels_key: str = "cell_type",
-    n_pick: int = 4000,
-    seed: int = 0,
-) -> ad.AnnData:
-    present = gene_names[gene_names.isin(adata.var_names)]
-    pool = np.asarray(row_index, dtype=np.int64) if row_index is not None else np.arange(adata.n_obs, dtype=np.int64)
-    n_pick = min(n_pick, int(pool.size))
-    backed = getattr(adata, "isbacked", False) or getattr(adata, "is_view", False)
-    if n_pick >= pool.size and not backed:
-        out = adata[pool, present].copy() if row_index is not None else adata[:, present].copy()
-    else:
-        if labels_key in adata.obs.columns:
-            labels = adata.obs[labels_key].iloc[pool]
-            local = stratified_pick_indices(labels, n_pick, max(1, 3), seed=seed)
-        else:
-            local = np.random.default_rng(seed).choice(pool.size, min(n_pick, pool.size), replace=False)
-        pick = pool[local]
-        sub = adata[pick, present]
-        out = sub.to_memory() if backed else sub.copy()
-    if labels_key in adata.obs.columns:
-        src = adata.obs[labels_key].iloc[pool] if row_index is not None else adata.obs[labels_key]
-        out.uns["_knn_full_label_counts"] = src.astype(str).value_counts()
-    return out
-
-
 def open_backed_gene_view(h5ad_path: str | Path, gene_panel: pd.Index) -> ad.AnnData:
     backed = ad.read_h5ad(h5ad_path, backed="r")
-    present = pd.Index([g for g in map(str, gene_panel) if g in backed.var_names])
+    panel = pd.Index(map(str, gene_panel))
+    present = panel.intersection(pd.Index(map(str, backed.var_names)))
     if len(present) == 0:
         if getattr(backed, "file", None) is not None:
             backed.file.close()
@@ -178,87 +135,6 @@ def setup_backed_anndata(
     return view
 
 
-class AnnTorchDataset(Dataset):
-    """torch Dataset that slices rows from a backed AnnData (HDF5) on __getitem__."""
-
-    def __init__(
-        self,
-        adata_manager: AnnDataManager,
-        getitem_tensors: list | dict[str, type] | None = None,
-        load_sparse_tensor: bool = False,
-    ):
-        super().__init__()
-        if adata_manager.adata is None:
-            raise ValueError("Please run ``register_fields`` on ``adata_manager`` first.")
-        self.adata_manager = adata_manager
-        self.keys_and_dtypes = getitem_tensors
-        self.load_sparse_tensor = load_sparse_tensor
-
-    @property
-    def registered_keys(self):
-        return self.adata_manager.data_registry.keys()
-
-    @property
-    def keys_and_dtypes(self):
-        return self._keys_and_dtypes
-
-    @keys_and_dtypes.setter
-    def keys_and_dtypes(self, getitem_tensors: list | dict[str, type] | None):
-        if isinstance(getitem_tensors, list):
-            keys_to_dtypes = {key: registry_key_to_default_dtype(key) for key in getitem_tensors}
-        elif isinstance(getitem_tensors, dict):
-            keys_to_dtypes = getitem_tensors
-        elif getitem_tensors is None:
-            keys_to_dtypes = {
-                key: registry_key_to_default_dtype(key) for key in self.registered_keys
-            }
-        else:
-            raise ValueError("`getitem_tensors` must be a `list`, `dict`, or `None`")
-        for key in keys_to_dtypes:
-            if key not in self.registered_keys:
-                raise KeyError(f"{key} not found in the data registry.")
-        self._keys_and_dtypes = keys_to_dtypes
-
-    @property
-    def data(self):
-        if not hasattr(self, "_data"):
-            self._data = {
-                key: self.adata_manager.get_from_registry(key) for key in self.keys_and_dtypes
-            }
-        return self._data
-
-    def __len__(self):
-        return self.adata_manager.adata.shape[0]
-
-    def __getitem__(self, indexes: int | list[int] | slice) -> dict[str, np.ndarray | torch.Tensor]:
-        single_idx = isinstance(indexes, (int, np.integer))
-        if single_idx:
-            indexes = [int(indexes)]
-        if self.adata_manager.adata.isbacked and isinstance(indexes, list | np.ndarray):
-            indexes = np.sort(indexes)
-        data_map = {}
-        for key, dtype in self.keys_and_dtypes.items():
-            data = self.data[key]
-            if isinstance(data, np.ndarray | h5py.Dataset):
-                sliced_data = data[indexes].astype(dtype, copy=False)
-            elif isinstance(data, pd.DataFrame):
-                sliced_data = data.iloc[indexes, :].to_numpy().astype(dtype, copy=False)
-            elif sp.issparse(data) or isinstance(data, SparseDataset):
-                sliced_data = data[indexes].astype(dtype, copy=False)
-                if self.load_sparse_tensor:
-                    sliced_data = scipy_to_torch_sparse(sliced_data)
-                else:
-                    sliced_data = sliced_data.toarray()
-            elif isinstance(data, str) and key == REGISTRY_KEYS.MINIFY_TYPE_KEY:
-                continue
-            else:
-                raise TypeError(f"{key} is not a supported type")
-            if single_idx and isinstance(sliced_data, np.ndarray) and sliced_data.ndim > 1 and sliced_data.shape[0] == 1:
-                sliced_data = np.squeeze(sliced_data, axis=0)
-            data_map[key] = sliced_data
-        return data_map
-
-
 def collate_scvi_batch(batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
     out: dict[str, torch.Tensor] = {}
     for key in batch[0]:
@@ -280,7 +156,7 @@ def collate_scvi_batch(batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
 class EmbeddingBatchDataset(Dataset):
     def __init__(
         self,
-        base: AnnTorchDataset | Subset,
+        base: Dataset,
         embedding: np.ndarray | None,
         subset_positions: np.ndarray | None = None,
     ):
@@ -300,20 +176,6 @@ class EmbeddingBatchDataset(Dataset):
         return item
 
 
-def contiguous_batch_sampler(row_index: np.ndarray, batch_size: int) -> Iterator[list[int]]:
-    if row_index.size == 0:
-        return
-    order = np.argsort(row_index)
-    sorted_rows = row_index[order]
-    run_start = 0
-    for i in range(1, len(sorted_rows) + 1):
-        if i == len(sorted_rows) or sorted_rows[i] != sorted_rows[i - 1] + 1:
-            run_positions = order[run_start:i].tolist()
-            for j in range(0, len(run_positions), batch_size):
-                yield run_positions[j : j + batch_size]
-            run_start = i
-
-
 class BackedScanviDataModule(L.LightningDataModule):
     def __init__(
         self,
@@ -324,7 +186,7 @@ class BackedScanviDataModule(L.LightningDataModule):
         batch_size: int = 128,
         num_workers: int = 0,
         shuffle: bool = False,
-        tensor_keys: Sequence[str] | None = None,
+        tensor_keys: list[str] | None = None,
     ):
         super().__init__()
         self.adata_manager = adata_manager
@@ -380,7 +242,6 @@ class TTALightningModule(L.LightningModule):
         lr: float = 1e-3,
         m0_lr: float = 1e-4,
         weight_decay: float = 1e-6,
-        energy_only: bool = True,
     ):
         super().__init__()
         self.tta_model = tta_model
@@ -388,7 +249,6 @@ class TTALightningModule(L.LightningModule):
         self.lr = lr
         self.m0_lr = m0_lr
         self.weight_decay = weight_decay
-        self.energy_only = energy_only
         self._configure_trainable()
 
     def _configure_trainable(self) -> None:

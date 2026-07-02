@@ -1,9 +1,26 @@
-from ._scanvae import SCANVAE
+from __future__ import annotations
 
-from typing import Literal
-
-from scvi.nn import FCLayers
+import logging
 from collections import namedtuple
+from copy import deepcopy
+from pathlib import Path
+from typing import Optional, Union
+
+import lightning as L
+import numpy as np
+import pandas as pd
+import torch
+from anndata import AnnData
+from scvi.data._constants import _SETUP_ARGS_KEY, _SETUP_METHOD_NAME
+from scvi.model._utils import parse_device_args
+from scvi.model.base._save_load import _initialize_model, _load_saved_files, _validate_var_names
+from torch.linalg import vector_norm
+
+from ._scanvae import SCANVAE
+from ._scanvi import SCANVI, _device_from_use_gpu
+from .data import BackedScanviDataModule, TTALightningModule, setup_backed_anndata
+
+logger = logging.getLogger(__name__)
 
 AdaptHeadLoss = namedtuple(
     "AdaptHeadLoss",
@@ -12,46 +29,15 @@ AdaptHeadLoss = namedtuple(
 )
 
 
-from scvi.nn import DecoderSCVI
-from scvi.distributions import NegativeBinomial
-from torch.distributions import Normal
-from torch.distributions import kl_divergence as kl
-import torch
-import numpy as np
-from torch.linalg import vector_norm
-
 class Adapt(SCANVAE):
-    """Align observational SCANVI latents on Parse (or other query) gene counts.
+    """Energy TTA: align reference SCANVI latents to Parse gene counts via ``m0`` encoder.
 
-    **Parse pipeline (``energy_only=True``)** — primary path in ``perturbation.py``:
-
-    * **Target** ``embedding``: reference SCANVI latent for each Parse PBS adapt cell
-      (from ``ensure_energy_embedding_backed``, not scGPT or other obsm).
-    * **Input** ``X``: backed Parse gene counts streamed via ``BackedScanviDataModule``.
-    * **Loss**: energy score between target latent and ``m0`` encoder ``z`` on Parse counts.
-
-    When ``energy_only`` is false, a projection head and NB panel decoder support
-    legacy cross-modal adaptation (external embeddings with different dimension).
+    ``X`` is backed Parse counts; ``embedding`` is the reference latent target; loss is
+    the energy score between target and ``m0`` encoder ``z``.
     """
 
-    def __init__(
-        self,
-        m0_module: SCANVAE,
-        n_input: int = 100,
-        n_output: int = 100,
-        n_hidden: int = 128,
-        n_layers: int = 2,
-        dropout_rate: float = 0.1,
-        use_batch_norm: Literal["encoder", "decoder", "none", "both"] = "both",
-        use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "none",
-        energy_only: bool | None = None,
-        **model_kwargs,
-    ):
+    def __init__(self, m0_module: SCANVAE, n_latent: int, **model_kwargs):
         model_kwargs = dict(model_kwargs)
-        n_latent = getattr(m0_module, "n_latent", 10)
-        if energy_only is None:
-            energy_only = n_input == n_latent
-        self.energy_only = bool(energy_only)
         model_kwargs.setdefault("n_batch", getattr(m0_module, "n_batch", 0))
         model_kwargs.setdefault("n_labels", max(1, getattr(m0_module, "n_labels", 1)))
         model_kwargs.setdefault("n_latent", n_latent)
@@ -59,134 +45,53 @@ class Adapt(SCANVAE):
         model_kwargs.setdefault(
             "gene_likelihood", getattr(m0_module, "gene_likelihood", "zinb")
         )
-
         super().__init__(
-            n_input=n_input,
-            n_hidden=n_hidden,
-            n_layers=n_layers,
-            dropout_rate=dropout_rate,
-            use_batch_norm=use_batch_norm,
-            use_layer_norm=use_layer_norm,
+            n_input=n_latent,
+            n_hidden=model_kwargs.pop("n_hidden", 128),
+            n_layers=model_kwargs.pop("n_layers", 2),
+            dropout_rate=model_kwargs.pop("dropout_rate", 0.1),
             **model_kwargs,
         )
-        if self.energy_only:
-            self.projection_layer = None
-            self.decoder = None
-            self.px_r_m0 = None
-        else:
-            self.projection_layer = FCLayers(
-                n_in=n_input,
-                n_out=n_latent,
-                n_layers=n_layers,
-                n_hidden=n_hidden,
-                dropout_rate=dropout_rate,
-                use_batch_norm=use_batch_norm,
-                use_layer_norm=use_layer_norm,
-            )
-            self.decoder = DecoderSCVI(
-                n_input=n_latent,
-                n_output=n_output,
-                n_layers=n_layers,
-                n_hidden=n_hidden,
-                use_batch_norm=use_batch_norm,
-                use_layer_norm=use_layer_norm,
-            )
-            self.px_r_m0 = torch.nn.Parameter(torch.randn(n_output))
         self.init_params_ = self._get_init_params(locals())
         self.was_pretrained = False
         self.m0 = m0_module
-        self.use_embedding_for_inference = True
 
-        # EWC state. Empty until `register_ewc_anchor` is called; while empty the
-        # penalty computed in `SCANVAE.loss_with_replay` is 0 (the zip is empty).
-        self.old_params = []
-        self.importances = []
-        self.ctrl_importances = []
-
-    def _get_init_params(self, locals):
-        return {k: v for k, v in locals.items() if k != "self"}
+    def _get_init_params(self, locals_):
+        return {k: v for k, v in locals_.items() if k != "self"}
 
     def _get_inference_input(self, tensors):
-        """Route gene-count batches through ``m0`` when not in embedding mode."""
-        if not self.use_embedding_for_inference:
-            return self.m0._get_inference_input(tensors)
-        inputs = super()._get_inference_input(tensors)
-        if "embedding" in tensors:
-            inputs["x"] = tensors["embedding"]
-        return inputs
+        return self.m0._get_inference_input(tensors)
 
     def inference(self, *args, **kwargs):
-        if not self.use_embedding_for_inference:
-            return self.m0.inference(*args, **kwargs)
-        return super().inference(*args, **kwargs)
+        return self.m0.inference(*args, **kwargs)
 
     def _get_generative_input(self, tensors, inference_outputs, **kwargs):
-        if not self.use_embedding_for_inference:
-            return self.m0._get_generative_input(tensors, inference_outputs, **kwargs)
-        return super()._get_generative_input(tensors, inference_outputs, **kwargs)
+        return self.m0._get_generative_input(tensors, inference_outputs, **kwargs)
 
     def generative(self, *args, **kwargs):
-        if not self.use_embedding_for_inference:
-            return self.m0.generative(*args, **kwargs)
-        return super().generative(*args, **kwargs)
-
-    def _source_latent(self, emb: torch.Tensor) -> torch.Tensor:
-        if self.projection_layer is not None:
-            return self.projection_layer(emb)
-        return emb
+        return self.m0.generative(*args, **kwargs)
 
     def _adaptation_head_loss(self, tensors, m0_inference_outputs):
-        """Energy alignment of source latent to ``m0`` gene-count encoder ``z``."""
         if "embedding" not in tensors:
             raise KeyError(
                 "Adaptation loss expected `embedding` in tensors (reference SCANVI latent). "
                 f"Available keys: {list(tensors.keys())}"
             )
-        emb = tensors["embedding"]
-        z_target = self._source_latent(emb)
+        z_target = tensors["embedding"]
         m0_z = m0_inference_outputs["z"]
         if z_target.shape[-1] != m0_z.shape[-1]:
             raise ValueError(
                 "Latent dim mismatch for energy TTA: "
-                f"target embedding {tuple(z_target.shape)} vs m0 z {tuple(m0_z.shape)}. "
-                "Parse PBS adapt expects reference SCANVI latents (same n_latent as m0), "
-                "not an external embedding (e.g. scGPT) unless energy_only=False with a projection head."
+                f"target embedding {tuple(z_target.shape)} vs m0 z {tuple(m0_z.shape)}."
             )
         if not any(p.requires_grad for p in self.m0.parameters()):
             m0_z = m0_z.detach()
         energy_score_loss = self.energy_loss(z_target, m0_z, verbose=False)
-
-        if self.energy_only:
-            loss = energy_score_loss.mean()
-            zero = torch.zeros((), device=loss.device, dtype=loss.dtype)
-            return AdaptHeadLoss(
-                loss=loss,
-                reconstruction_loss=zero,
-                energy_score_loss=energy_score_loss.mean(),
-            )
-
-        if "x_m1" not in tensors:
-            raise KeyError(
-                "Panel adaptation expected `x_m1` in tensors. "
-                f"Available keys: {list(tensors.keys())}"
-            )
-        x_m1 = tensors["x_m1"]
-        library_emb = torch.log(x_m1.sum(dim=1, keepdim=True).clamp_min(1e-8))
-        _, _, px_rate_emb, _ = self.decoder("gene", z_target, library_emb)
-        theta = torch.exp(self.px_r_m0.clamp(min=-12, max=12))
-        if theta.shape[-1] != px_rate_emb.shape[-1]:
-            raise ValueError(
-                "Adapt decoder output and px_r_m0 must match X_target gene "
-                f"dimension (got px_rate {px_rate_emb.shape[-1]} vs "
-                f"px_r_m0 {theta.shape[-1]})."
-            )
-        reconst_loss_emb = -NegativeBinomial(mu=px_rate_emb, theta=theta).log_prob(
-            x_m1
-        ).sum(dim=-1)
-        loss = (reconst_loss_emb + energy_score_loss).mean()
+        loss = energy_score_loss.mean()
+        zero = torch.zeros((), device=loss.device, dtype=loss.dtype)
         return AdaptHeadLoss(
             loss=loss,
-            reconstruction_loss=reconst_loss_emb.mean(),
+            reconstruction_loss=zero,
             energy_score_loss=energy_score_loss.mean(),
         )
 
@@ -196,199 +101,281 @@ class Adapt(SCANVAE):
             "SCANVI Lightning replay is not supported."
         )
 
-    def register_ewc_anchor(self, importances=None, ctrl_importances=None):
-        """Snapshot the current trainable params as the EWC anchor.
-
-        After calling this, `SCANVAE.loss_with_replay` regularizes the module's
-        trainable parameters toward this snapshot, weighted by the (Fisher)
-        importances. This anchors the *adaptation* module to its current state;
-        it does not touch or reference the reference ``m0`` weights.
-
-        Parameters
-        ----------
-        importances
-            List of ``(name, tensor)`` importances aligned with the module's
-            trainable ``named_parameters()`` (e.g. produced by
-            ``ADAPT._compute_importances``). If ``None``, uniform importances
-            (ones) are used, i.e. a plain quadratic anchor.
-        ctrl_importances
-            List of ``(name, tensor)`` control importances. If ``None``, ones
-            are used so the ``"product"`` penalty reduces to
-            ``importance * (param - anchor) ** 2``.
-        """
-        self.old_params = [
-            (n, p.clone().detach())
-            for n, p in self.named_parameters()
-            if p.requires_grad
-        ]
-        if importances is None:
-            importances = [(n, torch.ones_like(p)) for n, p in self.old_params]
-        if ctrl_importances is None:
-            ctrl_importances = [(n, torch.ones_like(p)) for n, p in self.old_params]
-        self.importances = importances
-        self.ctrl_importances = ctrl_importances
-    
-    def vectorize(self,x, multichannel=False):
-        """Vectorize data in any shape.
-
-        Args:
-            x (torch.Tensor): input data
-            multichannel (bool, optional): whether to keep the multiple channels (in the second dimension). Defaults to False.
-
-        Returns:
-            torch.Tensor: data of shape (sample_size, dimension) or (sample_size, num_channel, dimension) if multichannel is True.
-        """
+    def vectorize(self, x, multichannel=False):
         if len(x.shape) == 1:
             return x.unsqueeze(1)
         if len(x.shape) == 2:
             return x
-        else:
-            if not multichannel: # one channel
-                return x.reshape(x.shape[0], -1)
-            else: # multi-channel
-                return x.reshape(x.shape[0], x.shape[1], -1)
+        if not multichannel:
+            return x.reshape(x.shape[0], -1)
+        return x.reshape(x.shape[0], x.shape[1], -1)
 
     def energy_loss(self, x_true, x_est, beta=1, verbose=True):
-        """
-        Energy score loss, returned per data example (not averaged).
-
-        Args:
-            x_true (torch.Tensor): shape [N, D]
-            x_est (list of Tensors or a single tensor): 
-                - List of M tensors of shape [N, D], or 
-                - Tensor of shape [N*M, D] to be split into M samples.
-            beta (float): power parameter.
-            verbose (bool): if True, also return s1 and s2 terms per example.
-
-        Returns:
-            Tensor of shape [N] (if verbose=False), or (loss, s1, s2) if verbose=True.
-        """
         if isinstance(beta, torch.Tensor):
             beta_val = beta.item()
         else:
             beta_val = float(beta)
-        EPS = 0 if beta_val.is_integer() else 1e-5
-        x_true = self.vectorize(x_true).unsqueeze(1)  # shape: [N, 1, D]
-
+        eps = 0 if beta_val.is_integer() else 1e-5
+        x_true = self.vectorize(x_true).unsqueeze(1)
         if not isinstance(x_est, list):
-            N = x_true.shape[0]
-            M = x_est.shape[0] // N
-            x_est = list(torch.split(x_est, N, dim=0))
-        M = len(x_est)
-        x_est = [self.vectorize(xi).unsqueeze(1) for xi in x_est]  # each: [N, 1, D]
-        x_est = torch.cat(x_est, dim=1)  # shape: [N, M, D]
-
-        # --- s1: distance from x_true to each sample ---
-        s1 = (vector_norm(x_est - x_true, 2, dim=2) + EPS).pow(beta).mean(dim=1)  # shape: [N]
-
-        # --- s2: average pairwise distance among samples per example ---
-        # For M <= 1, the pairwise term is undefined (division by zero in
-        # unbiased scaling), so we set it to 0.
-        if M <= 1:
+            n = x_true.shape[0]
+            m = x_est.shape[0] // n
+            x_est = list(torch.split(x_est, n, dim=0))
+        m = len(x_est)
+        x_est = [self.vectorize(xi).unsqueeze(1) for xi in x_est]
+        x_est = torch.cat(x_est, dim=1)
+        s1 = (vector_norm(x_est - x_true, 2, dim=2) + eps).pow(beta).mean(dim=1)
+        if m <= 1:
             s2 = torch.zeros_like(s1)
         else:
-            dists = torch.cdist(x_est, x_est, p=2) + EPS  # shape: [N, M, M]
-            s2 = dists.pow(beta).mean(dim=(1, 2)) * M / (M - 1)  # shape: [N]
-
-        # --- final loss per example ---
-        loss = s1 - s2 / 2  # shape: [N]
-
-        
+            dists = torch.cdist(x_est, x_est, p=2) + eps
+            s2 = dists.pow(beta).mean(dim=(1, 2)) * m / (m - 1)
+        loss = s1 - s2 / 2
         if verbose:
             return loss, s1, s2
+        return loss
+
+
+class TTA_SCANVI(SCANVI):
+    """Energy-only test-time adaptation for Parse PBS cells on backed HDF5 gene counts."""
+
+    def __init__(
+        self,
+        adata: AnnData,
+        m0_model: SCANVI,
+        adapt_kwargs: Optional[dict] = None,
+        **kwargs,
+    ):
+        super().__init__(adata, **kwargs)
+        self.m0_model = m0_model
+        adapt_kwargs = adapt_kwargs or {}
+        n_latent = int(getattr(m0_model.module, "n_latent", 10))
+        self.module = Adapt(m0_module=self.m0_model.module, n_latent=n_latent, **adapt_kwargs)
+        self.was_pretrained = False
+
+    @classmethod
+    def from_trained_scanvi(cls, reference_model: SCANVI, adapt_kwargs: Optional[dict] = None):
+        reference_model._check_if_trained(warn=False)
+        model = deepcopy(reference_model)
+        model.__class__ = cls
+        model.m0_model = reference_model
+        adapt_kwargs = adapt_kwargs or {}
+        n_latent = int(reference_model.module.n_latent)
+        model.module = Adapt(
+            m0_module=deepcopy(reference_model.module),
+            n_latent=n_latent,
+            **adapt_kwargs,
+        )
+        model.was_pretrained = True
+        return model
+
+    def _latent_encoder_module(self):
+        return self.module.m0
+
+    def train_test_time_adaptation(
+        self,
+        adata: AnnData,
+        embedding_key: str,
+        *,
+        max_epochs: Optional[int] = None,
+        batch_size: int = 128,
+        train_size: float = 1.0,
+        use_gpu: Optional[Union[str, int, bool]] = None,
+        plan_kwargs: Optional[dict] = None,
+        row_index: np.ndarray | None = None,
+        embedding: np.ndarray | None = None,
+        x_adapt_key: str | None = None,
+        **kwargs,
+    ):
+        del kwargs
+        if x_adapt_key is not None and x_adapt_key != embedding_key:
+            raise ValueError(
+                "x_adapt_key differs from embedding_key; Parse energy TTA uses gene counts "
+                "from X and reference SCANVI latents only."
+            )
+        if not isinstance(self.module, Adapt):
+            raise TypeError("train_test_time_adaptation expects an Adapt module.")
+
+        adata = self._validate_anndata(adata)
+        adata_manager = self.get_anndata_manager(adata, required=True)
+        device = _device_from_use_gpu(use_gpu)
+        logger.info("TTA device: %s", device)
+
+        if row_index is None:
+            row_index = np.arange(adata.n_obs, dtype=np.int64)
         else:
-            return loss
+            row_index = np.asarray(row_index, dtype=np.int64)
 
-
-
-    def energy_loss_two_sample(self, x0, x, xp, x0p=None, beta=1, verbose=True, weights=None, mask=None):
-        """
-        Per-example loss function based on the energy score (estimated from two samples).
-
-        Args:
-            x0 (torch.Tensor): Sample from the true distribution. Shape: [N, D]
-            x (torch.Tensor): Sample from the estimated distribution. Shape: [N, D]
-            xp (torch.Tensor): Another sample from the estimated distribution. Shape: [N, D]
-            x0p (torch.Tensor, optional): Another sample from the true distribution. Shape: [N, D]
-            beta (float): Power parameter in the energy score.
-            verbose (bool): Whether to return s1, s2 (and s3 if x0p is given) per example.
-            weights (float or torch.Tensor, optional): Scalar or tensor of shape [N] for per-example weights.
-
-        Returns:
-            If verbose:
-                Tuple of three or four tensors of shape [N]: (loss, s1, s2[, s3])
-            Else:
-                Tensor of shape [N]: per-example loss
-        """
-        if isinstance(beta, torch.Tensor):
-            beta_val = beta.item()
+        if embedding is None:
+            if embedding_key not in adata.obsm:
+                raise KeyError(
+                    f"Missing obsm[{embedding_key!r}] and no embedding array passed."
+                )
+            emb = np.asarray(adata.obsm[embedding_key])
+            embedding = np.asarray(emb[row_index], dtype=np.float32)
         else:
-            beta_val = float(beta)
-        EPS = 0 if beta_val.is_integer() else 1e-5
+            embedding = np.asarray(embedding, dtype=np.float32)
 
-        x0 = self.vectorize(x0)
-        x = self.vectorize(x)
-        xp = self.vectorize(xp)
+        n_latent = int(self.module.m0.n_latent)
+        if embedding.ndim != 2 or embedding.shape[1] != n_latent:
+            raise ValueError(
+                f"embedding must be (n_cells, {n_latent}); got {embedding.shape}."
+            )
 
-        if weights is None:
-            weights = 1.0
-        
-        weights = torch.tensor(weights, device=x.device, dtype=x.dtype)
-        if weights.ndim == 0:
-            weights = weights.expand(x.shape[0])
-        elif weights.ndim != 1 or weights.shape[0] != x.shape[0]:
-            raise ValueError(f"Weights must be a scalar or a tensor of shape [{x.shape[0]}]")
+        if max_epochs is None:
+            max_epochs = 20
+        plan_kwargs = dict(plan_kwargs or {})
+        lr = float(plan_kwargs.get("lr", 1e-3))
+        m0_lr = float(plan_kwargs.get("m0_lr", lr))
+        weight_decay = float(plan_kwargs.get("weight_decay", 1e-6))
 
-        if x0p is None:
-            # s1 terms
-            s1_term1 = (vector_norm(x - x0, 2, dim=1) + EPS).pow(beta) / 2
-            s1_term2 = (vector_norm(xp - x0, 2, dim=1) + EPS).pow(beta) / 2
-            s1 = s1_term1 + s1_term2
-
-            # s2 term
-            s2 = (vector_norm(x - xp, 2, dim=1) + EPS).pow(beta) / 2
-
-            loss = (s1 - s2) * weights
-
-            if mask is not None:
-                if not torch.is_floating_point(mask) and mask.dtype != torch.bool:
-                    mask = mask.bool()
-                loss = loss[mask]
-                s1 = s1[mask]
-                s2 = s2[mask]
-                weights = weights[mask]
-            if verbose:
-                return loss, s1 * weights, s2 * weights
-            else:
-                return loss
-
+        train_n = int(np.floor(train_size * row_index.size))
+        if train_n >= row_index.size:
+            sel = np.arange(row_index.size)
         else:
-            x0p = self.vectorize(x0p)
+            sel = np.random.permutation(row_index.size)[:train_n]
+        train_rows = row_index[sel]
+        train_emb = embedding[sel]
+        if train_rows.size == 0:
+            raise ValueError("Test-time adaptation train split is empty; increase `train_size`.")
 
-            # s1 terms
-            s1_term1 = (vector_norm(x - x0, 2, dim=1) + EPS).pow(beta) / 4
-            s1_term2 = (vector_norm(xp - x0, 2, dim=1) + EPS).pow(beta) / 4
-            s1_term3 = (vector_norm(x - x0p, 2, dim=1) + EPS).pow(beta) / 4
-            s1_term4 = (vector_norm(xp - x0p, 2, dim=1) + EPS).pow(beta) / 4
-            s1 = s1_term1 + s1_term2 + s1_term3 + s1_term4
+        self.to_device(device)
+        self.module.train()
 
-            # s2 and s3 terms
-            s2 = (vector_norm(x - xp, 2, dim=1) + EPS).pow(beta) / 2
-            s3 = (vector_norm(x0 - x0p, 2, dim=1) + EPS).pow(beta) / 2
+        dm = BackedScanviDataModule(
+            adata_manager,
+            train_rows,
+            embedding=train_emb,
+            batch_size=batch_size,
+            shuffle=True,
+        )
+        lit = TTALightningModule(
+            self,
+            lr=lr,
+            m0_lr=m0_lr,
+            weight_decay=weight_decay,
+        )
+        accelerator = "gpu" if device.type == "cuda" else "cpu"
+        trainer = L.Trainer(
+            max_epochs=max_epochs,
+            accelerator=accelerator,
+            devices=1,
+            enable_checkpointing=False,
+            logger=False,
+            enable_progress_bar=False,
+        )
+        trainer.fit(lit, datamodule=dm)
 
-            loss = (s1 - s2 - s3) * weights
+        self.module.eval()
+        self.is_trained_ = True
+        history = {"tta": {"train_loss": [float(trainer.callback_metrics.get("train_loss", 0.0))]}}
+        if self.history_ is None:
+            self.history_ = history
+        else:
+            self.history_.update(history)
+        return history
 
-            if mask is not None:
-                if not torch.is_floating_point(mask) and mask.dtype != torch.bool:
-                    mask = mask.bool()
-                loss = loss[mask]
-                s1 = s1[mask]
-                s2 = s2[mask]
-                weights = weights[mask]
-            if verbose:
-                return loss, s1 * weights, s2 * weights, s3 * weights
-            else:
-                return loss
+    @staticmethod
+    def ensure_energy_embedding_backed(
+        reference: SCANVI,
+        adata: AnnData,
+        row_index: np.ndarray,
+        *,
+        batch_size: int | None = None,
+        use_gpu: Union[bool, str, int, None] = None,
+    ) -> np.ndarray:
+        """Reference SCANVI latents for backed Parse PBS adapt rows."""
+        reference._register_manager_for_instance(
+            reference.adata_manager.transfer_fields(
+                adata,
+                extend_categories=True,
+                allow_missing_labels=True,
+            )
+        )
+        return reference.embed_latent_from_backed(
+            adata,
+            row_index,
+            batch_size=batch_size,
+            use_gpu=use_gpu,
+        )
 
+    @classmethod
+    def run_energy_tta_backed(
+        cls,
+        reference: SCANVI,
+        *,
+        h5ad_path: str | Path,
+        row_index: np.ndarray,
+        gene_panel,
+        embedding: np.ndarray,
+        registry: dict,
+        out_dir: str | Path,
+        embedding_key: str = "X_tta_energy",
+        max_epochs: int = 20,
+        batch_size: int = 128,
+        use_gpu: Optional[Union[str, int, bool]] = None,
+        plan_kwargs: Optional[dict] = None,
+    ) -> "TTA_SCANVI":
+        """Train Parse energy TTA from backed h5ad (gene counts + reference latents)."""
+        view = setup_backed_anndata(SCANVI, h5ad_path, gene_panel, registry)
+        n_latent = int(reference.module.n_latent)
+        tta = cls.from_trained_scanvi(reference, adapt_kwargs={"n_latent": n_latent})
+        tta._register_manager_for_instance(
+            SCANVI._get_most_recent_anndata_manager(view, required=True)
+        )
+        tta.train_test_time_adaptation(
+            view,
+            embedding_key=embedding_key,
+            max_epochs=max_epochs,
+            batch_size=batch_size,
+            train_size=1.0,
+            use_gpu=use_gpu,
+            plan_kwargs=plan_kwargs or {},
+            row_index=row_index,
+            embedding=embedding,
+        )
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        tta.save(str(out_dir), overwrite=True, save_anndata=False)
+        return tta
 
-    
+    @classmethod
+    def load_inference(
+        cls,
+        dir_path: str,
+        adata: AnnData,
+        *,
+        device: int | str = "auto",
+    ):
+        """Load saved energy-TTA weights for embedding."""
+        if isinstance(device, int):
+            torch_device = _device_from_use_gpu(device)
+        else:
+            _, _, torch_device = parse_device_args(
+                accelerator="auto",
+                devices=device,
+                return_device="torch",
+                validate_single_device=True,
+            )
+        attr_dict, var_names, model_state_dict, _ = _load_saved_files(
+            dir_path, load_adata=False, map_location=torch_device
+        )
+        registry = attr_dict.pop("registry_")
+        n_latent = int(attr_dict["init_params_"]["non_kwargs"]["n_latent"])
+        _validate_var_names(adata, var_names)
+        method_name = registry.get(_SETUP_METHOD_NAME, "setup_anndata")
+        getattr(SCANVI, method_name)(adata, source_registry=registry, **registry[_SETUP_ARGS_KEY])
+        model = _initialize_model(SCANVI, adata, registry, attr_dict, None)
+        model.module = Adapt(
+            m0_module=deepcopy(model.module),
+            n_latent=n_latent,
+        )
+        sd = {k: v for k, v in model_state_dict.items() if "ewc_snap_" not in k}
+        sd.pop("pyro_param_store", None)
+        model.module.load_state_dict(sd, strict=True)
+        model.__class__ = cls
+        model.is_trained_ = True
+        model.module.eval()
+        model.to_device(torch_device)
+        model._validate_anndata(adata)
+        return model
